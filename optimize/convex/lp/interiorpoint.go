@@ -12,17 +12,8 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
-// // TODO(btracey): Could have a solver structure with an abstract factorizer. With
-// // this transformation the same high-level code could handle both Dense and Sparse.
-// // TODO(btracey): Need to improve error handling. Only want to panic if condition number inf.
-// // TODO(btracey): Performance enhancements. There are currently lots of linear
-// // solves that can be improved by doing rank-one updates. For example, the swap
-// // step is just a rank-one update.
-// // TODO(btracey): Better handling on the linear solve errors. If the condition
-// // number is not inf and the equation solved "well", should keep moving.
-
 var (
-	ErrOverRetry  = errors.New("lp: Over the max Retry")
+	ErrOverRetry = errors.New("lp: Over the max Retry")
 )
 
 const (
@@ -31,8 +22,8 @@ const (
 	BETA      = float64(0.5)
 	MaxRetry  = 1000
 	// TODO: Reset this value
-	EPSILONFEAS = float64(0.00000001)
-	EPSILON     = float64(0.00000001)
+	EPSILONFEAS = 1e-12
+	EPSILON     = 1e-12
 )
 
 type FunctionInfo struct {
@@ -49,76 +40,88 @@ type FunctionInfo struct {
 	Hess func(hess *mat.Dense, x []float64)
 }
 
-func PrimalDualInteriorPointMethod(problem *FunctionInfo, nonLinearConstrain []*FunctionInfo, linearConstrain, b *mat.Dense, initialPt []float64) ([]float64, error) {
+func PrimalDualInteriorPointMethod(problem *FunctionInfo, nonEqConstrain []*FunctionInfo, EqConstrain, b *mat.Dense, initialPt []float64, mu float64) ([]float64, error) {
 	x := make([]float64, len(initialPt))
 	copy(x, initialPt)
 	// TODO: How do we set lambda ?
-	m := len(nonLinearConstrain)
-	lambda := mat.NewDense(m, 1, nil)
-	mu := INITIALMU
-	nu := mat.NewDense(linearConstrain.RawMatrix().Rows, 1, nil)
+	m := len(nonEqConstrain)
+	nu := mat.NewDense(EqConstrain.RawMatrix().Rows, 1, nil)
+	// for i := 0; i < nu.RawMatrix().Rows; i++ {
+	// 	nu.Set(i, 0, 10)
+	// }
 
-	fFloatArray := computef(nonLinearConstrain, x)
-	Df := computeDf(nonLinearConstrain, x)
+	fFloatArray := computef(nonEqConstrain, x)
+	Df := computeDf(nonEqConstrain, x)
 	etaHat := float64(100)
 
 	f := mat.NewDense(m, 1, fFloatArray)
-	r := mat.NewDense(len(x)+m+linearConstrain.RawMatrix().Rows, 1, nil)
+	r := mat.NewDense(len(x)+m+EqConstrain.RawMatrix().Rows, 1, nil)
 	rdualNorm2 := floats.Norm(r.RawMatrix().Data[0:len(x)], 2)
 	rpriNorm2 := floats.Norm(r.RawMatrix().Data[len(x)+m:len(r.RawMatrix().Data)], 2)
-	Deltax := make([]float64, len(x))
-	DeltaLambda := make([]float64, m)
-	DeltaNu := make([]float64, linearConstrain.RawMatrix().Rows)
 	Finalx := make([]float64, len(x))
 	FinalLambda := make([]float64, m)
-	FinalNu := make([]float64, linearConstrain.RawMatrix().Rows)
+	FinalNu := make([]float64, EqConstrain.RawMatrix().Rows)
+
+	// Set lambda
+	lambdaSlice := make([]float64, m)
+	for i := 0; i < m; i++ {
+		lambdaSlice[i] = -1 / nonEqConstrain[i].Func(initialPt)
+	}
+	lambda := mat.NewDense(m, 1, lambdaSlice)
+	// Step1: Determine t. Set t := μm/ηˆ.
+	etaHat = computeEtaHat(fFloatArray, lambda.RawMatrix().Data)
+	tInverse := etaHat / (mu * float64(m))
 
 	// ∥rpri∥2 ≤ epsilon_feas, ∥rdual∥2 ≤ oepsilon_feas, and ηˆ ≤ epsilon.
 	for (rdualNorm2 > EPSILONFEAS) || (rpriNorm2 > EPSILONFEAS) || (etaHat > EPSILON) {
-		etaHat = computeEtaHat(fFloatArray, lambda.RawMatrix().Data)
-
-		// Step1: Determine t. Set t := μm/ηˆ.
-		t := mu * float64(m) / etaHat
-		tInverse := float64(1) / t
 		// Step2: Compute primal-dual search direction ∆ypd.
-		deltaY, err := computePrimeDualMethodMove(problem, x, nonLinearConstrain, f, Df, nu, b, lambda, linearConstrain, tInverse)
+		deltaY, err := computePrimeDualMethodMove(problem, x, nonEqConstrain, f, Df, nu, b, lambda, EqConstrain, tInverse)
 		if err != nil {
 			return nil, err
 		}
-		Deltax = deltaY[0:len(x)]
-		DeltaLambda = deltaY[len(x) : len(x)+m]
-		DeltaNu = deltaY[len(x)+m : len(deltaY)]
 
 		// Step3: Line search and update. Determine step length s > 0 and set y := y + s∆ypd.
-		Finalx, FinalLambda, FinalNu, err = lineSearch(problem, nonLinearConstrain, x, nu.RawMatrix().Data, lambda.RawMatrix().Data, DeltaLambda, Deltax, DeltaNu, f, Df, linearConstrain, b, tInverse)
+		Finalx, FinalLambda, FinalNu, err = lineSearch(problem, nonEqConstrain, x, nu.RawMatrix().Data, lambda.RawMatrix().Data, deltaY, f, Df, EqConstrain, b, tInverse)
 		if err != nil {
 			return nil, err
 		}
+		// Reset
+		x = Finalx
+		nu = mat.NewDense(nu.RawMatrix().Rows, nu.RawMatrix().Cols, FinalNu)
+		lambda = mat.NewDense(lambda.RawMatrix().Rows, lambda.RawMatrix().Cols, FinalLambda)
+		fFloatArray = computef(nonEqConstrain, x)
+		Df = computeDf(nonEqConstrain, x)
+		f = mat.NewDense(m, 1, fFloatArray)
 
-		r = computeRemainder(problem, Finalx, f, Df, mat.NewDense(m, 1, FinalLambda), mat.NewDense(linearConstrain.RawMatrix().Rows, 1, FinalNu), linearConstrain, b, tInverse)
+		etaHat = computeEtaHat(fFloatArray, lambda.RawMatrix().Data)
+		tInverse = etaHat / (mu * float64(m))
+
+		r = computeRemainder(problem, x, f, Df, lambda, nu, EqConstrain, b, tInverse)
 		rdualNorm2 = floats.Norm(r.RawMatrix().Data[0:len(x)], 2)
 		rpriNorm2 = floats.Norm(r.RawMatrix().Data[len(x)+m:len(r.RawMatrix().Data)], 2)
 	}
-	return Finalx, nil
+	return x, nil
 }
 
 // TODO: Compute General Gradient
-func computeDf(nonLinearConstrain []*FunctionInfo, x []float64) *mat.Dense {
-	result := mat.NewDense(len(nonLinearConstrain), len(x), nil)
-	for i := 0; i < len(nonLinearConstrain); i++ {
+func computeDf(nonEqConstrain []*FunctionInfo, x []float64) *mat.Dense {
+	//result := mat.NewDense(len(nonEqConstrain), len(x), nil)
+	gradSlice := make([]float64, 0)
+	for i := 0; i < len(nonEqConstrain); i++ {
 		temp := make([]float64, len(x))
-		nonLinearConstrain[i].Grad(temp, x)
-		for j := 0; j < len(x); j++ {
-			result.Set(i, j, temp[j])
-		}
+		nonEqConstrain[i].Grad(temp, x)
+		gradSlice = append(gradSlice, temp...)
+		// for j := 0; j < len(x); j++ {
+		// 	result.Set(i, j, temp[j])
+		// }
 	}
-	return result
+	return mat.NewDense(len(nonEqConstrain), len(x), gradSlice)
 }
 
-func computef(nonLinearConstrain []*FunctionInfo, x []float64) []float64 {
-	result := make([]float64, len(nonLinearConstrain))
-	for i := 0; i < len(nonLinearConstrain); i++ {
-		result[i] = nonLinearConstrain[i].Func(x)
+func computef(nonEqConstrain []*FunctionInfo, x []float64) []float64 {
+	result := make([]float64, len(nonEqConstrain))
+	for i := 0; i < len(nonEqConstrain); i++ {
+		result[i] = nonEqConstrain[i].Func(x)
 	}
 	return result
 }
@@ -134,27 +137,34 @@ func computePrimalDualSearchDirection() {
 
 func computeRemainder(f0 *FunctionInfo, x []float64, f, Df *mat.Dense, lambda *mat.Dense, Nu *mat.Dense, A *mat.Dense, b *mat.Dense, tInverse float64) *mat.Dense {
 	Df0 := make([]float64, len(x))
-	for i := 0; i < len(Df0); i++ {
-		f0.Grad(Df0, x)
-	}
-	mat.NewDense(len(x), 1, Df0)
+	f0.Grad(Df0, x)
+	//fmt.Println("f0:", Df0)
 
-	var rdual, rpri, AtransposeMulNu *mat.Dense
-	rdual.Mul(Df, lambda)
+	rdual := mat.NewDense(len(x), 1, nil)
+	rpri := mat.NewDense(A.RawMatrix().Rows, 1, nil)
+
+	DfTransPose := mat.NewDense(Df.RawMatrix().Cols, Df.RawMatrix().Rows, nil)
+	DfTransPose.CloneFrom(Df.T())
+
+	AtransposeMulNu := mat.NewDense(A.RawMatrix().Cols, A.RawMatrix().Rows, nil)
+	// Compute ∇f_0(x)+Df(x)^T*λ+A^Tv
+	rdual.Mul(DfTransPose, lambda)
 	AtransposeMulNu.CloneFrom(A.T())
-	AtransposeMulNu.Mul(AtransposeMulNu, Nu)
-	rdual.Add(rdual, AtransposeMulNu)
+	product := mat.NewDense(AtransposeMulNu.RawMatrix().Rows, Nu.RawMatrix().Cols, nil)
+	product.Mul(AtransposeMulNu, Nu)
+	rdual.Add(rdual, product)
 	rdual.Add(rdual, mat.NewDense(len(x), 1, Df0))
 
+	// Compute -diag(λ)f(x) - 1/t*I
 	rcentFloat64 := make([]float64, lambda.RawMatrix().Rows)
 	fFloat64 := f.RawMatrix().Data
-	copy(rcentFloat64, lambda.RawMatrix().Data)
+	//copy(rcentFloat64, lambda.RawMatrix().Data)
 	for i := 0; i < len(rcentFloat64); i++ {
-		rcentFloat64[i] *= fFloat64[i]
+		rcentFloat64[i] = lambda.RawMatrix().Data[i] * fFloat64[i]
 		rcentFloat64[i] += tInverse
-		rcentFloat64[i] = -1 * rcentFloat64[i]
+		rcentFloat64[i] *= -1
 	}
-
+	// Compute Ax-b
 	rpri.Mul(A, mat.NewDense(len(x), 1, x))
 	rpri.Sub(rpri, b)
 
@@ -163,43 +173,47 @@ func computeRemainder(f0 *FunctionInfo, x []float64, f, Df *mat.Dense, lambda *m
 	return mat.NewDense(len(result), 1, result)
 }
 
-func computeKKTMatrix(f0 *FunctionInfo, x []float64, nonLinearConstrain []*FunctionInfo, f, df, lambda, A *mat.Dense) *mat.Dense {
+func computeKKTMatrix(f0 *FunctionInfo, x []float64, nonEqConstrain []*FunctionInfo, f, Df, lambda, A *mat.Dense) *mat.Dense {
 	hass := mat.NewDense(len(x), len(x), nil)
 	f0.Hess(hass, x)
 	sumHass := make([]float64, len(hass.RawMatrix().Data))
 	for i := 0; i < len(sumHass); i++ {
 		sumHass[i] = hass.RawMatrix().Data[i]
 	}
-	for i := 0; i < len(nonLinearConstrain); i++ {
+	// Compute ∇^2f_0(x)+sum_i=1^m = λi∇^2f_i(x)
+	for i := 0; i < len(nonEqConstrain); i++ {
 		temp := mat.NewDense(len(x), len(x), nil)
-		nonLinearConstrain[i].Hess(temp, x)
+		nonEqConstrain[i].Hess(temp, x)
 		tempScale := make([]float64, len(temp.RawMatrix().Data))
 		// TODO : Check it
 		floats.ScaleTo(tempScale, lambda.RawMatrix().Data[i], temp.RawMatrix().Data)
-		floats.Add(sumHass, tempScale)
+		floats.AddTo(sumHass, sumHass, tempScale)
 	}
 
-	var DfTranspose, ATranspose *mat.Dense
-	DfTranspose.CloneFrom(df.T())
+	DfTranspose := mat.NewDense(Df.RawMatrix().Cols, Df.RawMatrix().Rows, nil)
+	ATranspose := mat.NewDense(A.RawMatrix().Cols, A.RawMatrix().Rows, nil)
+	DfTranspose.CloneFrom(Df.T())
 	ATranspose.CloneFrom(A.T())
 
-	negDiagLambdaMulDf := make([]float64, len(df.RawMatrix().Data))
+	// -diag(lambda)*Df(x)
+	negDiagLambdaMulDf := make([]float64, len(Df.RawMatrix().Data))
 	for i := 0; i < len(lambda.RawMatrix().Data); i++ {
 		temp := 0 - lambda.RawMatrix().Data[i]
-		iIndex := i * df.RawMatrix().Cols
-		for j := 0; j < df.RawMatrix().Cols; j++ {
+		iIndex := i * Df.RawMatrix().Cols
+		for j := 0; j < Df.RawMatrix().Cols; j++ {
 			index := iIndex + j
-			negDiagLambdaMulDf[index] = temp * df.RawMatrix().Data[index]
+			negDiagLambdaMulDf[index] = temp * Df.RawMatrix().Data[index]
 		}
 	}
 
-	negDiagf := mat.NewDense(len(nonLinearConstrain), len(nonLinearConstrain), nil)
-	for i := 0; i < len(nonLinearConstrain); i++ {
+	// -diag(f(x))
+	negDiagf := mat.NewDense(len(nonEqConstrain), len(nonEqConstrain), nil)
+	for i := 0; i < len(nonEqConstrain); i++ {
 		negDiagf.Set(i, i, -1*f.RawMatrix().Data[i])
 	}
 
 	// Combine all matrices
-	dim := len(x) + len(nonLinearConstrain) + A.RawMatrix().Rows
+	dim := len(x) + len(nonEqConstrain) + A.RawMatrix().Rows
 	result := mat.NewDense(dim, dim, nil)
 
 	// Set ∇^2f_0(x)+sum_i=1^m = λi∇^2f_i(x)
@@ -211,63 +225,80 @@ func computeKKTMatrix(f0 *FunctionInfo, x []float64, nonLinearConstrain []*Funct
 	}
 
 	// Set -diag(lambda)*Df(x)
+	diagNegDf := make([]float64, len(Df.RawMatrix().Data))
+	for i := 0; i < lambda.RawMatrix().Rows; i++ {
+		starIndex := i * Df.RawMatrix().Cols
+		for j := 0; j < Df.RawMatrix().Cols; j++ {
+			index := starIndex + j
+			diagNegDf[index] = (0 - lambda.RawMatrix().Data[i]) * Df.RawMatrix().Data[index]
+		}
+	}
+	matNegDiagDf := mat.NewDense(Df.RawMatrix().Rows, Df.RawMatrix().Cols, diagNegDf)
 	startRowIndex := len(x)
-	for i := 0; i < len(nonLinearConstrain); i++ {
+	for i := 0; i < len(nonEqConstrain); i++ {
 		for j := 0; j < len(x); j++ {
-			result.Set(startRowIndex+i, j, negDiagf.At(i, j))
+			result.Set(startRowIndex+i, j, matNegDiagDf.At(i, j))
 		}
 	}
 
 	// Set Df^T
 	startColumnIndex := len(x)
-	for i := 0; i < len(nonLinearConstrain); i++ {
-		for j := 0; j < len(x); j++ {
+	for i := 0; i < len(x); i++ {
+		for j := 0; j < len(nonEqConstrain); j++ {
 			result.Set(i, startColumnIndex+j, DfTranspose.At(i, j))
 		}
 	}
 
 	// Set -diag(f)
-	for i := 0; i < len(nonLinearConstrain); i++ {
-		for j := 0; j < len(nonLinearConstrain); j++ {
+	for i := 0; i < len(nonEqConstrain); i++ {
+		for j := 0; j < len(nonEqConstrain); j++ {
 			result.Set(startRowIndex+i, startColumnIndex+j, negDiagf.At(i, j))
 		}
 	}
 
 	// Set A^T
-	startColumnIndex += len(nonLinearConstrain)
+	startColumnIndex += len(nonEqConstrain)
 	for i := 0; i < ATranspose.RawMatrix().Rows; i++ {
 		for j := 0; j < ATranspose.RawMatrix().Cols; j++ {
 			result.Set(i, startColumnIndex+j, ATranspose.At(i, j))
 		}
 	}
+
 	// Set A
-	startRowIndex += len(nonLinearConstrain)
+	startRowIndex += len(nonEqConstrain)
 	for i := 0; i < A.RawMatrix().Rows; i++ {
 		for j := 0; j < A.RawMatrix().Cols; j++ {
 			result.Set(i+startRowIndex, j, A.At(i, j))
 		}
 	}
+
 	return result
 }
 
-func computePrimeDualMethodMove(f0 *FunctionInfo, x []float64, nonLinearConstrain []*FunctionInfo, f, df, Nu, b, lambda, A *mat.Dense, tInverse float64) ([]float64, error) {
-	KKTMatrix := computeKKTMatrix(f0, x, nonLinearConstrain, f, df, lambda, A)
-	r := computeRemainder(f0, x, f, df, lambda, Nu, A, b, tInverse)
-
-	var solution *mat.Dense
+func computePrimeDualMethodMove(f0 *FunctionInfo, x []float64, nonEqConstrain []*FunctionInfo, f, Df, Nu, b, lambda, A *mat.Dense, tInverse float64) ([]float64, error) {
+	KKTMatrix := computeKKTMatrix(f0, x, nonEqConstrain, f, Df, lambda, A)
+	r := computeRemainder(f0, x, f, Df, lambda, Nu, A, b, tInverse)
+	solution := mat.NewDense(KKTMatrix.RawMatrix().Rows, KKTMatrix.RawMatrix().Cols, nil)
 	err := solution.Inverse(KKTMatrix)
 	if err != nil {
 		return nil, err
 	}
-	solution.Mul(solution, r)
-	result := solution.RawMatrix().Data
-	floats.Scale(-1, result)
-	return result, nil
+	result := mat.NewDense(solution.RawMatrix().Rows, r.RawMatrix().Cols, nil)
+	result.Mul(solution, r)
+	floats.ScaleTo(result.RawMatrix().Data, -1, result.RawMatrix().Data)
+	return result.RawMatrix().Data, nil
 }
 
-func lineSearch(f0 *FunctionInfo, nonLinearConstrain []*FunctionInfo, x, Nu, lambda, DeltaLambda, Deltax, Deltamu []float64, f, Df, A, b *mat.Dense, tInverse float64) ([]float64, []float64, []float64, error) {
+func lineSearch(f0 *FunctionInfo, nonEqConstrain []*FunctionInfo, x, Nu, lambda, deltaY []float64, f, Df, A, b *mat.Dense, tInverse float64) ([]float64, []float64, []float64, error) {
+	Deltax := deltaY[0:len(x)]
+	DeltaLambda := deltaY[len(x) : len(x)+len(nonEqConstrain)]
+	DeltaNu := deltaY[len(x)+len(nonEqConstrain):]
 	sMax := 1.0
+	// min{1, min{-lambda_i / Delta lambda_i | Delta lambda_i < 0}}
 	for i := 0; i < len(lambda); i++ {
+		if DeltaLambda[i] >= 0 {
+			continue
+		}
 		temp := (0 - lambda[i]) / DeltaLambda[i]
 		if sMax > temp {
 			sMax = temp
@@ -276,14 +307,15 @@ func lineSearch(f0 *FunctionInfo, nonLinearConstrain []*FunctionInfo, x, Nu, lam
 	s := 0.99 * sMax
 	xPlus := make([]float64, len(x))
 	lambdaPlus := make([]float64, len(lambda))
-	muPlus := make([]float64, len(Nu))
+	nuPlus := make([]float64, len(Nu))
+	// x^+ := x+s*Delta_pd
 	floats.ScaleTo(xPlus, s, Deltax)
-	floats.Add(xPlus, x)
+	floats.AddTo(xPlus, xPlus, x)
 
 	for i := 0; i <= MaxRetry; i++ {
 		bCorrect := true
-		for j := 0; j < len(nonLinearConstrain); j++ {
-			if nonLinearConstrain[j].Func(xPlus) > 0 {
+		for j := 0; j < len(nonEqConstrain); j++ {
+			if nonEqConstrain[j].Func(xPlus) > 0 {
 				bCorrect = false
 				break
 			}
@@ -291,33 +323,36 @@ func lineSearch(f0 *FunctionInfo, nonLinearConstrain []*FunctionInfo, x, Nu, lam
 		if bCorrect {
 			break
 		}
-		s = s * BETA
+		s *= BETA
 		floats.ScaleTo(xPlus, s, Deltax)
-		floats.Add(xPlus, x)
+		floats.AddTo(xPlus, xPlus, x)
 		if i == MaxRetry {
 			return nil, nil, nil, ErrOverRetry
 		}
 	}
+	// || r_t(x^+, lambda^+, nu^+)||_2 <= (1-alpha*s)*||r_t(x, lambda, nu)||_2
 	floats.ScaleTo(lambdaPlus, s, DeltaLambda)
-	floats.Add(lambdaPlus, lambda)
-	floats.ScaleTo(muPlus, s, Deltamu)
-	floats.Add(muPlus, Nu)
+	floats.AddTo(lambdaPlus, lambdaPlus, lambda)
+	floats.ScaleTo(nuPlus, s, DeltaNu)
+	floats.AddTo(nuPlus, nuPlus, Nu)
 	compareNorm := floats.Norm(computeRemainder(f0, x, f, Df, mat.NewDense(len(lambda), 1, lambda), mat.NewDense(len(Nu), 1, Nu), A, b, tInverse).RawMatrix().Data, 2)
 	for i := 0; i <= MaxRetry; i++ {
-		rMatrix := computeRemainder(f0, xPlus, f, Df, mat.NewDense(len(lambdaPlus), 1, lambdaPlus), mat.NewDense(len(muPlus), 1, muPlus), A, b, tInverse)
+		rMatrix := computeRemainder(f0, xPlus, f, Df, mat.NewDense(len(lambdaPlus), 1, lambdaPlus), mat.NewDense(len(nuPlus), 1, nuPlus), A, b, tInverse)
 		rNorm := floats.Norm(rMatrix.RawMatrix().Data, 2)
 		comparePart := (1 - ALHPHA*s) * compareNorm
-		if rNorm > comparePart {
-			s = s * BETA
-			floats.ScaleTo(xPlus, s, Deltax)
-			floats.Add(xPlus, x)
-			floats.ScaleTo(lambdaPlus, s, DeltaLambda)
-			floats.Add(lambdaPlus, lambda)
-			floats.ScaleTo(muPlus, s, Deltamu)
-			floats.Add(muPlus, Nu)
-			break
+		//fmt.Println("rNorm:", rNorm)
+		//fmt.Println("compareNorm:", compareNorm)
+		if rNorm <= comparePart {
+			return xPlus, lambdaPlus, nuPlus, nil
 		}
-		return nil, nil, nil, ErrOverRetry
+		s *= BETA
+		floats.ScaleTo(xPlus, s, Deltax)
+		floats.AddTo(xPlus, xPlus, x)
+		floats.ScaleTo(lambdaPlus, s, DeltaLambda)
+		floats.AddTo(lambdaPlus, lambdaPlus, lambda)
+		floats.ScaleTo(nuPlus, s, DeltaNu)
+		floats.AddTo(nuPlus, nuPlus, Nu)
+		//fmt.Println("s:", s)
 	}
-	return xPlus, lambdaPlus, muPlus, nil
+	return nil, nil, nil, ErrOverRetry
 }
