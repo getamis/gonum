@@ -5,7 +5,7 @@ go 1.17
 require (
 	github.com/google/go-cmp v0.5.7
 	golang.org/x/exp v0.0.0-20191002040644-a1355ae1e2c3
-	golang.org/x/tools v0.0.0-20190927191325-030b2cf1153e
+	golang.org/x/tools v0.1.12
 	gonum.org/v1/plot v0.9.0
 )
 
@@ -17,5 +17,5 @@ require (
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/phpdave11/gofpdf v1.4.2 // indirect
 	golang.org/x/image v0.0.0-20210216034530-4410531fe030 // indirect
-	golang.org/x/text v0.3.5 // indirect
+	golang.org/x/text v0.3.8 // indirect
 )
